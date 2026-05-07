@@ -16,6 +16,8 @@ import traceback
 from jinja2 import Template
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, TaskType, get_peft_model
+
 os.umask(0)
 
 
@@ -23,12 +25,50 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level='INFO')
 
 
+def parse_target_modules(modules_text):
+    return [module.strip() for module in modules_text.split(",") if module.strip()]
+
+
+def get_trainable_parameter_stats(model):
+    trainable = 0
+    total = 0
+    for param in model.parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable += param.numel()
+    return trainable, total
+
+
 class Train_dataset(torch.utils.data.Dataset):
     def __init__(self, config, tokenizer):
         self.config = config
         self.tokenizer = tokenizer
-        with open(config.data_path) as f:
-            self.data = json.load(f)
+        if os.path.isfile(config.data_path):
+            with open(config.data_path) as f:
+                self.data = json.load(f)
+        else:
+            try:
+                from datasets import load_dataset
+            except ImportError as e:
+                raise ImportError(
+                    "`datasets` is required when --data_path is a Hugging Face dataset id. "
+                    "Install it with `pip install datasets`."
+                ) from e
+
+            try:
+                dataset = load_dataset(config.data_path)
+            except ValueError as e:
+                if "Config name is missing" in str(e):
+                    dataset = load_dataset(config.data_path, "en_mix")
+                else:
+                    raise
+
+            if "train" in dataset:
+                split = dataset["train"]
+            else:
+                split_name = list(dataset.keys())[0]
+                split = dataset[split_name]
+            self.data = [dict(item) for item in split]
         
         newdata = []
         for da in self.data:
@@ -136,24 +176,53 @@ def train(args):
     
     accelerator.print(f'args:\n{args}')
 
-    accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.train_bsz_per_gpu
-    accelerator.state.deepspeed_plugin.deepspeed_config['train_batch_size'] = args.train_bsz_per_gpu*dist.get_world_size()*accelerator.gradient_accumulation_steps
-
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+    model.config.use_cache = False
 
     # open gradient checkpointing
-    model.gradient_checkpointing_enable()
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
 
-    no_decay = ["bias", "LayerNorm.weight"]
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=parse_target_modules(args.lora_target_modules),
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+
+    trainable_params, total_params = get_trainable_parameter_stats(model)
+    accelerator.print(
+        f'trainable params: {trainable_params:,} / {total_params:,} '
+        f'({100 * trainable_params / total_params:.4f}%)'
+    )
+
+    no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and not any(nd in n for nd in no_decay)
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and any(nd in n for nd in no_decay)
+            ],
             "weight_decay": 0.0,
         },
     ]
@@ -187,32 +256,19 @@ def train(args):
                     shutil.rmtree(os.path.join(args.output_dir, oldest_checkpoint))        
             os.makedirs(save_dir, exist_ok=True)
             output_dir = os.path.join(save_dir, 'tfmr')
-            if accelerator.state.deepspeed_plugin.zero_stage!=3:
-                model.save_pretrained(output_dir,state_dict=accelerator.get_state_dict(model))
             tokenizer.save_pretrained(output_dir)
-            copy_files = []
-            for item in os.listdir(args.model_path):
-                if os.path.exists(os.path.join(output_dir,item)):
-                    continue
-                if item.startswith("pytorch_model") and item.endswith(".bin"):
-                    continue
-                if item.endswith(".index.json") or item.endswith(".safetensors"):
-                    continue
-                s = os.path.join(args.model_path, item)
-                if os.path.isfile(s):
-                    shutil.copy(s, os.path.join(output_dir,item))
-                copy_files.append(item)
-            print(f'huggingface model save in {output_dir}, copy file:{copy_files}')
 
-        if accelerator.state.deepspeed_plugin.zero_stage==3:
-            unwrap_model = accelerator.unwrap_model(model)
-            unwrap_model.save_pretrained(os.path.join(save_dir, f'tfmr'),is_main_process=accelerator.is_main_process,save_function=accelerator.save,state_dict=accelerator.get_state_dict(model))
+        unwrap_model = accelerator.unwrap_model(model)
+        unwrap_model.save_pretrained(
+            os.path.join(save_dir, 'tfmr'),
+            is_main_process=accelerator.is_main_process,
+            save_function=accelerator.save,
+        )
             
         accelerator.wait_for_everyone()
         accelerator.save({"epoch": epoch, "step": step, "global_step": global_step}, os.path.join(save_dir, "training_state.pt"))
         accelerator.print(f'checkpoint checkpoint-{epoch}-{global_step} is saved...')
 
-    accelerator.print(accelerator.deepspeed_config)
     model.train()
 
     for epoch in range(start_epoch, args.n_epochs):
@@ -270,14 +326,18 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', default='./ckpts', type=str)
     parser.add_argument('--max_ckpts', default=2, type=int)
     parser.add_argument('--log_dir', default='./train_logs', type=str)
-    parser.add_argument('--max_seq_len', default=8192, type=int)
-    parser.add_argument('--gradient_checkpointing', action='store_true')
+    parser.add_argument('--max_seq_len', default=1024, type=int)
+    parser.add_argument('--gradient_checkpointing', action='store_true', default=True)
     parser.add_argument('--gradient_accumulation_steps', default=8, type=int)
-    parser.add_argument('--train_bsz_per_gpu', default=2, type=int)
+    parser.add_argument('--train_bsz_per_gpu', default=1, type=int)
     parser.add_argument('--weight_decay', default=0.1, type=float)
-    parser.add_argument('--learning_rate', default=5e-6, type=float)
+    parser.add_argument('--learning_rate', default=2e-4, type=float)
     parser.add_argument('--warmup_rates', default=0.05, type=float)
     parser.add_argument('--n_epochs', default=3, type=int)
+    parser.add_argument('--lora_r', default=8, type=int)
+    parser.add_argument('--lora_alpha', default=16, type=int)
+    parser.add_argument('--lora_dropout', default=0.05, type=float)
+    parser.add_argument('--lora_target_modules', default='q_proj,k_proj,v_proj,o_proj', type=str)
 
     # Other Args
     parser.add_argument('--seed', default=42, type=int)
