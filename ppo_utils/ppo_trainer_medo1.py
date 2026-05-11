@@ -80,6 +80,33 @@ INVALID_LOGPROB = 1.0
 # for o1
 accumulate_rewards = []
 
+
+def get_module_device(module: nn.Module) -> torch.device:
+    parameter = next(module.parameters(), None)
+    if parameter is not None:
+        return parameter.device
+
+    buffer = next(module.buffers(), None)
+    if buffer is not None:
+        return buffer.device
+
+    return torch.device("cpu")
+
+
+def forward_on_model_device(model: nn.Module, query_response: torch.Tensor, pad_token_id: int) -> torch.Tensor:
+    model_device = get_module_device(model)
+    output = forward(model, query_response.to(model_device), pad_token_id)
+    return output.logits.to(query_response.device)
+
+
+def get_reward_on_model_device(
+    model: nn.Module, query_response: torch.Tensor, pad_token_id: int, context_length: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    model_device = get_module_device(model)
+    reward, score, mask = get_reward(model, query_response.to(model_device), pad_token_id, context_length)
+    target_device = query_response.device
+    return reward.to(target_device), score.to(target_device), mask.to(target_device)
+
 # Using our get_reward
 def get_reward_o1(
     model, response_ids, tokenizer, reward_tokenizer, pad_token_id, sub_answer,max_length = 4000
@@ -164,9 +191,10 @@ class PolicyAndValueWrapper(nn.Module):
     def forward(self, **kwargs):
         output = self.critic_backbone(
             **kwargs,
+            use_cache=False,
         )
         logits = self.value_model.score(output.hidden_states[-1])
-        return self.policy(**kwargs), logits
+        return self.policy(**kwargs, use_cache=False), logits
 
 
 class PPOTrainer(Trainer):
@@ -242,6 +270,9 @@ class PPOTrainer(Trainer):
             self.ref_policy = create_reference_model(self.policy)
 
         self.reward_model = reward_model
+        self.reward_model_is_quantized = any(
+            getattr(self.reward_model, attr, False) for attr in ("is_loaded_in_4bit", "is_loaded_in_8bit")
+        )
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
@@ -373,9 +404,14 @@ class PPOTrainer(Trainer):
             if self.ref_policy is None:
                 if not self.is_peft_model:
                     raise ValueError("No reference model and model is not a Peft model.")
+            self.ref_policy_cpu_offload = self.ref_policy is not None
+            self.reward_model_cpu_offload = False
+            if self.ref_policy_cpu_offload:
+                self.ref_policy.eval().to("cpu")
+            if not self.reward_model_cpu_offload and not self.reward_model_is_quantized:
+                self.reward_model.eval().to(accelerator.device)
             else:
-                self.ref_policy = self.ref_policy.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+                self.reward_model.eval()
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -512,13 +548,17 @@ class PPOTrainer(Trainer):
                     if ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
+                            ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     else:
-                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                        ref_logits = forward_on_model_device(ref_policy, query_response, processing_class.pad_token_id)[
+                            :, context_length - 1 : -1
+                        ]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                     ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-                    del ref_output, ref_logits, ref_all_logprob
+                    if ref_policy is None:
+                        del ref_output
+                    del ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
@@ -788,7 +828,7 @@ class PPOTrainer(Trainer):
                     )
 
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
+                    _, score, _ = get_reward_on_model_device(
                         self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
                     table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
